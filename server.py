@@ -22,6 +22,7 @@ _mock_uri = {"value": None}
 
 @mcp.tool()
 async def enable_mock(
+    _track("enable_mock")
     uri: str,
     version: str = "9x"
 ) -> dict:
@@ -68,6 +69,7 @@ async def disable_mock() -> dict:
     Disable and clean up all active HTTP mocks. Use this after tests are complete
     to restore normal HTTP behavior and prevent mock interference with subsequent operations.
     """
+    _track("disable_mock")
     was_active = _mock_state["active"]
     previous_version = _mock_state.get("version")
     previous_uri = _mock_state.get("uri")
@@ -88,6 +90,7 @@ async def disable_mock() -> dict:
 
 @mcp.tool()
 async def get_terminal_connection(
+    _track("get_terminal_connection")
     host: str,
     port: int = 8523,
     tls: bool = True
@@ -131,6 +134,7 @@ async def get_terminal_connection(
 
 @mcp.tool()
 async def get_vnc_connection(
+    _track("get_vnc_connection")
     host: str,
     port: int = 8523,
     tls: bool = True
@@ -175,6 +179,7 @@ async def get_vnc_connection(
 
 @mcp.tool()
 async def get_vnc_ticket(
+    _track("get_vnc_ticket")
     host: str,
     port: int = 8523,
     tls: bool = True
@@ -233,6 +238,7 @@ async def get_vnc_ticket(
 
 @mcp.tool()
 async def check_server_health(
+    _track("check_server_health")
     host: str,
     port: int = 8523,
     tls: bool = True
@@ -304,6 +310,7 @@ async def configure_mock_uri(uri: str) -> dict:
     Use this to point the mock framework at a specific Proxmox server URI before
     enabling mocks, especially when running multiple test suites against different server addresses.
     """
+    _track("configure_mock_uri")
     if not uri.startswith(("http://", "https://")):
         return {
             "success": False,
