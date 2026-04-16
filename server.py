@@ -10,336 +10,303 @@ from typing import Optional
 
 mcp = FastMCP("go-proxmox")
 
-# In-memory store for active mock interceptor state
-_mock_interceptors: dict = {}
+# In-memory state for mock intercepts
+_mock_intercepts_active = False
+_mock_config = {}
 
 
 @mcp.tool()
-async def enable_mock_interceptor(
-    uri: str,
-    version: str = "9x"
-) -> dict:
-    """Enable HTTP mock interception for a specific Proxmox VE version (6x, 7x, 8x, or 9x).
-    Use this when setting up tests or development environments that need to simulate
-    Proxmox API responses without a real server. Defaults to Proxmox VE 9x if no version is specified."""
-    valid_versions = {"6x", "7x", "8x", "9x"}
+async def enable_mock_intercepts(uri: str, version: str = "9x") -> dict:
+    """
+    Enable HTTP mock intercepts for a specific Proxmox VE version during testing.
+    Use this to set up mock HTTP responses that simulate a real Proxmox VE API,
+    allowing tests to run without a live Proxmox instance.
+    Supports versions 6.x, 7.x, 8.x, and 9.x.
+    """
+    global _mock_intercepts_active, _mock_config
+
+    valid_versions = ["6x", "7x", "8x", "9x"]
     if version not in valid_versions:
         return {
             "success": False,
-            "error": f"Invalid version '{version}'. Accepted values: {', '.join(sorted(valid_versions))}."
+            "error": f"Invalid version '{version}'. Accepted values: {valid_versions}"
         }
+
+    _mock_intercepts_active = True
+    _mock_config = {
+        "uri": uri,
+        "version": version
+    }
 
     version_map = {
         "6x": "ProxmoxVE6x",
         "7x": "ProxmoxVE7x",
         "8x": "ProxmoxVE8x",
-        "9x": "ProxmoxVE9x",
-    }
-
-    func_name = version_map[version]
-    _mock_interceptors[uri] = {
-        "uri": uri,
-        "version": version,
-        "func": func_name,
-        "active": True
+        "9x": "ProxmoxVE9x"
     }
 
     return {
         "success": True,
-        "message": f"Mock interceptor enabled for Proxmox VE {version} at {uri}",
-        "uri": uri,
-        "version": version,
-        "interceptor_function": func_name,
-        "description": (
-            f"This simulates the go-proxmox mocks.{func_name}(config.Config{{URI: '{uri}'}}) call. "
-            f"All HTTP requests to {uri} will be intercepted and mocked with Proxmox VE {version} responses."
+        "message": f"Mock HTTP intercepts enabled for Proxmox VE {version} at {uri}",
+        "config": {
+            "uri": uri,
+            "version": version,
+            "mock_function": version_map[version]
+        },
+        "details": (
+            f"Simulating Proxmox VE {version[0]}.x API responses. "
+            "All HTTP requests to the configured URI will be intercepted "
+            "and responded to with pre-recorded mock data. "
+            "Call disable_mock_intercepts when testing is complete."
         )
     }
 
 
 @mcp.tool()
-async def disable_mock_interceptor() -> dict:
-    """Disable all active HTTP mock interceptors (gock interceptors).
-    Use this after tests are complete to restore real HTTP behavior and prevent
-    mock responses from leaking into production or other test cases."""
-    active_count = len(_mock_interceptors)
-    active_uris = list(_mock_interceptors.keys())
-    _mock_interceptors.clear()
+async def disable_mock_intercepts() -> dict:
+    """
+    Disable and clean up all active HTTP mock intercepts.
+    Use this after tests complete to restore normal HTTP behavior and prevent
+    mock responses from leaking into other tests or production code.
+    """
+    global _mock_intercepts_active, _mock_config
+
+    if not _mock_intercepts_active:
+        return {
+            "success": True,
+            "message": "No active mock intercepts to disable.",
+            "was_active": False
+        }
+
+    previous_config = dict(_mock_config)
+    _mock_intercepts_active = False
+    _mock_config = {}
 
     return {
         "success": True,
-        "message": "All mock interceptors have been disabled.",
-        "interceptors_removed": active_count,
-        "uris_cleared": active_uris,
-        "description": (
-            "This simulates the go-proxmox mocks.Off() call which internally calls gock.Off() "
-            "to disable all active HTTP mock interceptors."
+        "message": "All active HTTP mock intercepts have been disabled and cleaned up.",
+        "was_active": True,
+        "previous_config": previous_config,
+        "details": (
+            "Normal HTTP behavior has been restored. "
+            "Mock responses will no longer intercept requests to the Proxmox API."
         )
     }
 
 
 @mcp.tool()
-async def get_vnc_ticket(server_url: str) -> dict:
-    """Retrieve a VNC ticket from the Proxmox server.
-    Use this when you need to authenticate and establish a VNC remote display session
-    for a virtual machine or container."""
-    url = server_url.rstrip("/") + "/vnc-ticket"
+async def connect_terminal(host: str, port: int = 8523) -> dict:
+    """
+    Establish a WebSocket terminal session to a Proxmox VE node or VM.
+    Use this when you need interactive shell access to a Proxmox node or
+    virtual machine console via a browser-compatible WebSocket connection.
+    """
+    base_url = f"https://{host}:{port}"
+    term_url = f"{base_url}/term"
+    ws_url = f"wss://{host}:{port}/term"
+
+    # Check if the endpoint is reachable via HTTP first
+    reachable = False
+    error_detail = None
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(base_url)
+            reachable = response.status_code < 500
+    except httpx.ConnectError as e:
+        error_detail = f"Connection refused or host unreachable: {str(e)}"
+    except httpx.TimeoutException as e:
+        error_detail = f"Connection timed out: {str(e)}"
+    except Exception as e:
+        error_detail = f"Unexpected error: {str(e)}"
+
+    return {
+        "success": reachable,
+        "connection_type": "terminal",
+        "host": host,
+        "port": port,
+        "http_endpoint": term_url,
+        "websocket_endpoint": ws_url,
+        "handler": "impl.Term",
+        "reachable": reachable,
+        "error": error_detail,
+        "instructions": (
+            f"Connect your WebSocket client to {ws_url} to establish an interactive "
+            "terminal session. This endpoint is served by the go-proxmox term-and-vnc "
+            "example server using the impl.Term handler."
+        ) if reachable else f"Could not reach server at {base_url}. Error: {error_detail}"
+    }
+
+
+@mcp.tool()
+async def connect_vnc(host: str, port: int = 8523) -> dict:
+    """
+    Establish a WebSocket VNC session to a Proxmox VE virtual machine's graphical console.
+    Use this when you need graphical (GUI) remote access to a VM running on Proxmox,
+    streamed over a WebSocket for browser compatibility.
+    """
+    base_url = f"https://{host}:{port}"
+    vnc_url = f"{base_url}/vnc"
+    ws_url = f"wss://{host}:{port}/vnc"
+
+    reachable = False
+    error_detail = None
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(base_url)
+            reachable = response.status_code < 500
+    except httpx.ConnectError as e:
+        error_detail = f"Connection refused or host unreachable: {str(e)}"
+    except httpx.TimeoutException as e:
+        error_detail = f"Connection timed out: {str(e)}"
+    except Exception as e:
+        error_detail = f"Unexpected error: {str(e)}"
+
+    return {
+        "success": reachable,
+        "connection_type": "vnc",
+        "host": host,
+        "port": port,
+        "http_endpoint": vnc_url,
+        "websocket_endpoint": ws_url,
+        "handler": "impl.Vnc",
+        "reachable": reachable,
+        "error": error_detail,
+        "instructions": (
+            f"Connect your VNC/WebSocket client to {ws_url} to establish a graphical "
+            "console session. This endpoint is served by the go-proxmox term-and-vnc "
+            "example server using the impl.Vnc handler. "
+            "Retrieve a VNC ticket first using get_vnc_ticket if authentication is required."
+        ) if reachable else f"Could not reach server at {base_url}. Error: {error_detail}"
+    }
+
+
+@mcp.tool()
+async def get_vnc_ticket(host: str, port: int = 8523) -> dict:
+    """
+    Retrieve a VNC authentication ticket from the Proxmox VE API.
+    Use this before initiating a VNC session to obtain the short-lived ticket/token
+    required for authenticating the VNC WebSocket connection.
+    """
+    base_url = f"https://{host}:{port}"
+    ticket_url = f"{base_url}/vnc-ticket"
 
     try:
         async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            try:
-                data = response.json()
-            except Exception:
-                data = {"raw": response.text}
-            return {
-                "success": True,
-                "status_code": response.status_code,
-                "server_url": server_url,
-                "endpoint": url,
-                "ticket_data": data
-            }
+            response = await client.get(ticket_url)
+            if response.status_code == 200:
+                try:
+                    ticket_data = response.json()
+                except Exception:
+                    ticket_data = {"raw": response.text}
+                return {
+                    "success": True,
+                    "host": host,
+                    "port": port,
+                    "endpoint": ticket_url,
+                    "handler": "impl.VncTicket",
+                    "ticket_data": ticket_data,
+                    "status_code": response.status_code,
+                    "instructions": (
+                        "Use the returned ticket to authenticate your VNC WebSocket connection. "
+                        "Tickets are short-lived; use immediately after retrieval."
+                    )
+                }
+            else:
+                return {
+                    "success": False,
+                    "host": host,
+                    "port": port,
+                    "endpoint": ticket_url,
+                    "status_code": response.status_code,
+                    "error": f"Server returned HTTP {response.status_code}",
+                    "response_body": response.text[:500]
+                }
     except httpx.ConnectError as e:
         return {
             "success": False,
-            "error": "Connection failed",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "endpoint": ticket_url,
+            "error": f"Connection refused or host unreachable: {str(e)}"
         }
     except httpx.TimeoutException as e:
         return {
             "success": False,
-            "error": "Request timed out",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "endpoint": ticket_url,
+            "error": f"Connection timed out: {str(e)}"
         }
     except Exception as e:
         return {
             "success": False,
-            "error": "Unexpected error",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "endpoint": ticket_url,
+            "error": f"Unexpected error: {str(e)}"
         }
 
 
 @mcp.tool()
-async def connect_terminal(
-    server_url: str,
-    node: Optional[str] = None,
-    vmid: Optional[int] = None
-) -> dict:
-    """Establish a WebSocket terminal (xterm) session to a Proxmox VM or container via the term-and-vnc proxy.
-    Use this when an interactive shell session is needed for a virtual machine or container
-    through the browser-based terminal interface."""
-    base_url = server_url.rstrip("/")
-    # Build the terminal endpoint (WebSocket)
-    ws_url = base_url if base_url.startswith("wss://") or base_url.startswith("ws://") else base_url
-
-    params = {}
-    if node:
-        params["node"] = node
-    if vmid is not None:
-        params["vmid"] = vmid
-
-    # Attempt an HTTP GET to the /term endpoint to validate connectivity
-    http_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
-    term_http_url = http_url + "/term" if not http_url.endswith("/term") else http_url
-
-    connection_info = {
-        "websocket_url": ws_url if ws_url.endswith("/term") else ws_url + "/term",
-        "node": node,
-        "vmid": vmid,
-        "parameters": params
-    }
+async def check_api_health(host: str, port: int = 8523) -> dict:
+    """
+    Check whether the Proxmox API client server endpoint is reachable and responding.
+    Use this as a basic connectivity and health check before performing more complex
+    operations, or to verify the server is running correctly.
+    """
+    base_url = f"https://{host}:{port}"
 
     try:
         async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-            response = await client.get(term_http_url, params=params)
+            response = await client.get(base_url)
+            is_healthy = response.status_code == 200
+            response_body = response.text.strip()
+
             return {
                 "success": True,
+                "healthy": is_healthy,
+                "host": host,
+                "port": port,
+                "url": base_url,
                 "status_code": response.status_code,
-                "server_url": server_url,
-                "endpoint": term_http_url,
-                "connection_info": connection_info,
+                "response_body": response_body,
+                "expected_response": "hello world",
+                "response_matches_expected": response_body.lower() == "hello world",
                 "message": (
-                    f"Terminal endpoint is reachable. Connect via WebSocket to "
-                    f"{connection_info['websocket_url']} to start an interactive terminal session."
+                    f"Server at {base_url} is up and responding correctly."
+                    if is_healthy
+                    else f"Server at {base_url} responded with HTTP {response.status_code}."
                 )
             }
     except httpx.ConnectError as e:
         return {
             "success": False,
-            "error": "Connection failed - proxy may not be running",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-    except httpx.TimeoutException as e:
-        return {
-            "success": False,
-            "error": "Request timed out",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": "Unexpected error",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-
-
-@mcp.tool()
-async def connect_vnc(
-    server_url: str,
-    node: Optional[str] = None,
-    vmid: Optional[int] = None,
-    ticket: Optional[str] = None
-) -> dict:
-    """Establish a WebSocket VNC session to a Proxmox VM or container via the term-and-vnc proxy.
-    Use this when a graphical remote display session is needed for a virtual machine
-    through the browser-based VNC interface."""
-    base_url = server_url.rstrip("/")
-    ws_url = base_url if base_url.startswith("wss://") or base_url.startswith("ws://") else base_url
-
-    params = {}
-    if node:
-        params["node"] = node
-    if vmid is not None:
-        params["vmid"] = vmid
-    if ticket:
-        params["ticket"] = ticket
-
-    # Attempt HTTP check
-    http_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
-    vnc_http_url = http_url + "/vnc" if not http_url.endswith("/vnc") else http_url
-
-    vnc_ws_url = ws_url + "/vnc" if not ws_url.endswith("/vnc") else ws_url
-
-    connection_info = {
-        "websocket_url": vnc_ws_url,
-        "node": node,
-        "vmid": vmid,
-        "ticket_provided": ticket is not None,
-        "parameters": {k: v for k, v in params.items() if k != "ticket"}
-    }
-
-    if not ticket:
-        connection_info["hint"] = (
-            "No VNC ticket provided. Consider calling get_vnc_ticket first to obtain "
-            "an authentication ticket before establishing a VNC session."
-        )
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-            response = await client.get(vnc_http_url, params=params)
-            return {
-                "success": True,
-                "status_code": response.status_code,
-                "server_url": server_url,
-                "endpoint": vnc_http_url,
-                "connection_info": connection_info,
-                "message": (
-                    f"VNC endpoint is reachable. Connect via WebSocket to "
-                    f"{vnc_ws_url} to start a graphical VNC session."
-                )
-            }
-    except httpx.ConnectError as e:
-        return {
-            "success": False,
-            "error": "Connection failed - proxy may not be running",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-    except httpx.TimeoutException as e:
-        return {
-            "success": False,
-            "error": "Request timed out",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": "Unexpected error",
-            "detail": str(e),
-            "server_url": server_url,
-            "connection_info": connection_info
-        }
-
-
-@mcp.tool()
-async def check_proxy_health(server_url: str) -> dict:
-    """Verify that the term-and-vnc proxy server is running and reachable by calling its root endpoint.
-    Use this as a health check before attempting terminal or VNC connections to confirm
-    the proxy is operational."""
-    url = server_url.rstrip("/") + "/"
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return {
-                "success": True,
-                "healthy": True,
-                "status_code": response.status_code,
-                "server_url": server_url,
-                "endpoint": url,
-                "response_body": response.text,
-                "message": f"Proxy server at {server_url} is up and running."
-            }
-    except httpx.ConnectError as e:
-        return {
-            "success": False,
             "healthy": False,
-            "error": "Connection refused - proxy server may be down",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "url": base_url,
+            "error": f"Connection refused or host unreachable: {str(e)}",
+            "message": f"Server at {base_url} is not reachable."
         }
     except httpx.TimeoutException as e:
         return {
             "success": False,
             "healthy": False,
-            "error": "Request timed out - proxy server may be overloaded or unreachable",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "healthy": False,
-            "error": f"HTTP error {e.response.status_code}",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "url": base_url,
+            "error": f"Connection timed out: {str(e)}",
+            "message": f"Server at {base_url} timed out."
         }
     except Exception as e:
         return {
             "success": False,
             "healthy": False,
-            "error": "Unexpected error",
-            "detail": str(e),
-            "server_url": server_url,
-            "endpoint": url
+            "host": host,
+            "port": port,
+            "url": base_url,
+            "error": f"Unexpected error: {str(e)}",
+            "message": f"Failed to check health of server at {base_url}."
         }
 
 
