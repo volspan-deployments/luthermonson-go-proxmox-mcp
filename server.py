@@ -10,510 +10,337 @@ from typing import Optional
 
 mcp = FastMCP("go-proxmox")
 
-# In-memory session store for Proxmox connections
-_sessions: dict = {}
-_mock_environments: dict = {}
+# In-memory store for active mock interceptor state
+_mock_interceptors: dict = {}
 
 
-def _get_session(uri: str) -> Optional[dict]:
-    """Retrieve stored session credentials for a URI."""
-    return _sessions.get(uri)
-
-
-async def _proxmox_request(
-    method: str,
+@mcp.tool()
+async def enable_mock_interceptor(
     uri: str,
-    path: str,
-    verify_ssl: bool = True,
-    ticket: str = None,
-    csrf_token: str = None,
-    **kwargs
+    version: str = "9x"
 ) -> dict:
-    """Make an authenticated request to the Proxmox API."""
-    url = f"{uri.rstrip('/')}/api2/json{path}"
-    headers = {}
-    cookies = {}
-
-    if ticket:
-        cookies["PVEAuthCookie"] = ticket
-    if csrf_token:
-        headers["CSRFPreventionToken"] = csrf_token
-
-    async with httpx.AsyncClient(verify=verify_ssl, timeout=30.0) as client:
-        response = await client.request(
-            method,
-            url,
-            headers=headers,
-            cookies=cookies,
-            **kwargs
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-@mcp.tool()
-async def connect_proxmox(
-    uri: str,
-    username: str,
-    password: str,
-    tls_insecure: bool = False
-) -> dict:
-    """
-    Initialize and configure a connection to a Proxmox VE server.
-    Use this first before any other operations to set up the client
-    with the server URI and authentication credentials.
-    Supports Proxmox VE versions 6.x through 9.x.
-    """
-    try:
-        url = f"{uri.rstrip('/')}/api2/json/access/ticket"
-        async with httpx.AsyncClient(verify=not tls_insecure, timeout=30.0) as client:
-            response = await client.post(
-                url,
-                data={"username": username, "password": password}
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        ticket = data.get("data", {}).get("ticket")
-        csrf_token = data.get("data", {}).get("CSRFPreventionToken")
-        cap = data.get("data", {}).get("cap", {})
-
-        if not ticket:
-            return {"success": False, "error": "Authentication failed: no ticket received"}
-
-        # Store session
-        _sessions[uri] = {
-            "uri": uri,
-            "username": username,
-            "ticket": ticket,
-            "csrf_token": csrf_token,
-            "tls_insecure": tls_insecure,
-            "capabilities": cap
-        }
-
-        return {
-            "success": True,
-            "uri": uri,
-            "username": username,
-            "message": f"Successfully connected to Proxmox VE at {uri}",
-            "capabilities": cap
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def get_cluster_status(uri: str) -> dict:
-    """
-    Retrieve the current status and information about the Proxmox VE cluster,
-    including nodes, quorum state, and cluster name.
-    Use this to get a high-level overview of the cluster health and topology.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
-
-    try:
-        result = await _proxmox_request(
-            "GET",
-            uri,
-            "/cluster/status",
-            verify_ssl=not session["tls_insecure"],
-            ticket=session["ticket"],
-            csrf_token=session["csrf_token"]
-        )
-        return {"success": True, "data": result.get("data", [])}
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def list_nodes(uri: str) -> dict:
-    """
-    List all nodes in the Proxmox VE cluster with their status, CPU, memory,
-    and uptime information. Use this to get an inventory of all available compute nodes.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
-
-    try:
-        result = await _proxmox_request(
-            "GET",
-            uri,
-            "/nodes",
-            verify_ssl=not session["tls_insecure"],
-            ticket=session["ticket"],
-            csrf_token=session["csrf_token"]
-        )
-        nodes = result.get("data", [])
-        return {
-            "success": True,
-            "count": len(nodes),
-            "nodes": nodes
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def manage_virtual_machine(
-    uri: str,
-    node: str,
-    vmid: int,
-    action: str
-) -> dict:
-    """
-    Perform lifecycle operations on a Proxmox VE virtual machine (VM)
-    such as start, stop, reboot, suspend, or get status.
-    Use this to control VM state on a specific node.
-    Valid actions: 'start', 'stop', 'reboot', 'suspend', 'resume', 'status'.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
-
-    valid_actions = {"start", "stop", "reboot", "suspend", "resume", "status"}
-    if action not in valid_actions:
-        return {
-            "success": False,
-            "error": f"Invalid action '{action}'. Must be one of: {', '.join(sorted(valid_actions))}"
-        }
-
-    try:
-        verify_ssl = not session["tls_insecure"]
-        ticket = session["ticket"]
-        csrf_token = session["csrf_token"]
-
-        if action == "status":
-            result = await _proxmox_request(
-                "GET",
-                uri,
-                f"/nodes/{node}/qemu/{vmid}/status/current",
-                verify_ssl=verify_ssl,
-                ticket=ticket,
-                csrf_token=csrf_token
-            )
-            return {"success": True, "vmid": vmid, "node": node, "data": result.get("data", {})}
-        else:
-            result = await _proxmox_request(
-                "POST",
-                uri,
-                f"/nodes/{node}/qemu/{vmid}/status/{action}",
-                verify_ssl=verify_ssl,
-                ticket=ticket,
-                csrf_token=csrf_token
-            )
-            return {
-                "success": True,
-                "vmid": vmid,
-                "node": node,
-                "action": action,
-                "task": result.get("data"),
-                "message": f"Action '{action}' initiated for VM {vmid} on node {node}"
-            }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def get_vnc_console(
-    uri: str,
-    node: str,
-    vmid: int,
-    type: str = "vm"
-) -> dict:
-    """
-    Retrieve a VNC ticket and connection details for accessing the graphical
-    console of a Proxmox VE virtual machine or container.
-    Use this when a user needs browser-based or VNC client access to a VM's display.
-    Type can be 'vm' for virtual machines or 'lxc' for containers.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
-
-    if type not in {"vm", "lxc"}:
-        return {"success": False, "error": "type must be 'vm' or 'lxc'"}
-
-    try:
-        verify_ssl = not session["tls_insecure"]
-        ticket = session["ticket"]
-        csrf_token = session["csrf_token"]
-
-        if type == "vm":
-            path = f"/nodes/{node}/qemu/{vmid}/vncproxy"
-        else:
-            path = f"/nodes/{node}/lxc/{vmid}/vncproxy"
-
-        result = await _proxmox_request(
-            "POST",
-            uri,
-            path,
-            verify_ssl=verify_ssl,
-            ticket=ticket,
-            csrf_token=csrf_token,
-            data={"websocket": 1}
-        )
-        data = result.get("data", {})
-        return {
-            "success": True,
-            "vmid": vmid,
-            "node": node,
-            "type": type,
-            "ticket": data.get("ticket"),
-            "port": data.get("port"),
-            "cert": data.get("cert"),
-            "upid": data.get("upid"),
-            "user": data.get("user"),
-            "vnc_url": f"{uri}/api2/json/nodes/{node}/{'qemu' if type == 'vm' else 'lxc'}/{vmid}/vncwebsocket",
-            "message": f"VNC ticket obtained for {'VM' if type == 'vm' else 'container'} {vmid} on node {node}"
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def get_terminal_console(
-    uri: str,
-    node: str,
-    vmid: int,
-    type: str = "vm"
-) -> dict:
-    """
-    Establish a terminal (xterm/shell) WebSocket session for a Proxmox VE
-    virtual machine or container. Use this when the user needs CLI/shell access
-    to a VM or container via the Proxmox terminal proxy.
-    Type can be 'vm' for virtual machines or 'lxc' for containers.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
-
-    if type not in {"vm", "lxc"}:
-        return {"success": False, "error": "type must be 'vm' or 'lxc'"}
-
-    try:
-        verify_ssl = not session["tls_insecure"]
-        ticket = session["ticket"]
-        csrf_token = session["csrf_token"]
-
-        if type == "vm":
-            path = f"/nodes/{node}/qemu/{vmid}/termproxy"
-        else:
-            path = f"/nodes/{node}/lxc/{vmid}/termproxy"
-
-        result = await _proxmox_request(
-            "POST",
-            uri,
-            path,
-            verify_ssl=verify_ssl,
-            ticket=ticket,
-            csrf_token=csrf_token
-        )
-        data = result.get("data", {})
-        return {
-            "success": True,
-            "vmid": vmid,
-            "node": node,
-            "type": type,
-            "ticket": data.get("ticket"),
-            "port": data.get("port"),
-            "upid": data.get("upid"),
-            "user": data.get("user"),
-            "terminal_url": f"{uri}/api2/json/nodes/{node}/{'qemu' if type == 'vm' else 'lxc'}/{vmid}/vncwebsocket",
-            "message": f"Terminal session established for {'VM' if type == 'vm' else 'container'} {vmid} on node {node}"
-        }
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def setup_mock_environment(
-    uri: str,
-    version: str = "9x",
-    enabled: bool = True
-) -> dict:
-    """
-    Configure the mock HTTP interceptor for testing purposes against a specific
-    Proxmox VE version. Use this in test/development scenarios to simulate
-    Proxmox API responses without a real server.
-    Supports versions: '6x', '7x', '8x', '9x'.
-    """
+    """Enable HTTP mock interception for a specific Proxmox VE version (6x, 7x, 8x, or 9x).
+    Use this when setting up tests or development environments that need to simulate
+    Proxmox API responses without a real server. Defaults to Proxmox VE 9x if no version is specified."""
     valid_versions = {"6x", "7x", "8x", "9x"}
     if version not in valid_versions:
         return {
             "success": False,
-            "error": f"Invalid version '{version}'. Must be one of: {', '.join(sorted(valid_versions))}"
+            "error": f"Invalid version '{version}'. Accepted values: {', '.join(sorted(valid_versions))}."
         }
-
-    if not enabled:
-        if uri in _mock_environments:
-            del _mock_environments[uri]
-        return {
-            "success": True,
-            "uri": uri,
-            "enabled": False,
-            "message": f"Mock environment disabled for {uri}"
-        }
-
-    # Store mock environment configuration
-    _mock_environments[uri] = {
-        "uri": uri,
-        "version": version,
-        "enabled": True
-    }
-
-    # Simulate a mock session so other tools can be used
-    _sessions[uri] = {
-        "uri": uri,
-        "username": "mock@pam",
-        "ticket": f"PVE:mock@pam:MOCK_TICKET_{version.upper()}",
-        "csrf_token": f"MOCK_CSRF_TOKEN_{version.upper()}",
-        "tls_insecure": True,
-        "capabilities": {
-            "dc": {"Sys.PowerMgmt": 1, "Sys.Audit": 1},
-            "nodes": {"pve": {"Sys.Audit": 1}}
-        },
-        "mock": True
-    }
 
     version_map = {
-        "6x": "6.x",
-        "7x": "7.x",
-        "8x": "8.x",
-        "9x": "9.x"
+        "6x": "ProxmoxVE6x",
+        "7x": "ProxmoxVE7x",
+        "8x": "ProxmoxVE8x",
+        "9x": "ProxmoxVE9x",
+    }
+
+    func_name = version_map[version]
+    _mock_interceptors[uri] = {
+        "uri": uri,
+        "version": version,
+        "func": func_name,
+        "active": True
     }
 
     return {
         "success": True,
+        "message": f"Mock interceptor enabled for Proxmox VE {version} at {uri}",
         "uri": uri,
         "version": version,
-        "proxmox_version": version_map[version],
-        "enabled": True,
-        "message": f"Mock environment configured for Proxmox VE {version_map[version]} at {uri}",
-        "note": "This MCP server provides a simulation layer. For full mock interception (gock), use the go-proxmox package directly in Go test code.",
-        "mock_session": {
-            "username": "mock@pam",
-            "ticket": f"PVE:mock@pam:MOCK_TICKET_{version.upper()}",
-            "csrf_token": f"MOCK_CSRF_TOKEN_{version.upper()}"
-        }
+        "interceptor_function": func_name,
+        "description": (
+            f"This simulates the go-proxmox mocks.{func_name}(config.Config{{URI: '{uri}'}}) call. "
+            f"All HTTP requests to {uri} will be intercepted and mocked with Proxmox VE {version} responses."
+        )
     }
 
 
 @mcp.tool()
-async def list_virtual_machines(
-    uri: str,
-    node: Optional[str] = None,
-    resource_type: str = "all"
-) -> dict:
-    """
-    List all virtual machines and/or LXC containers on a specific node or
-    across the entire cluster. Use this to get an inventory of workloads
-    including their status, resource usage, and configuration.
-    resource_type can be 'vm', 'lxc', or 'all'.
-    """
-    session = _get_session(uri)
-    if not session:
-        return {"success": False, "error": f"No active session for {uri}. Please call connect_proxmox first."}
+async def disable_mock_interceptor() -> dict:
+    """Disable all active HTTP mock interceptors (gock interceptors).
+    Use this after tests are complete to restore real HTTP behavior and prevent
+    mock responses from leaking into production or other test cases."""
+    active_count = len(_mock_interceptors)
+    active_uris = list(_mock_interceptors.keys())
+    _mock_interceptors.clear()
 
-    if resource_type not in {"vm", "lxc", "all"}:
-        return {
-            "success": False,
-            "error": "resource_type must be 'vm', 'lxc', or 'all'"
-        }
+    return {
+        "success": True,
+        "message": "All mock interceptors have been disabled.",
+        "interceptors_removed": active_count,
+        "uris_cleared": active_uris,
+        "description": (
+            "This simulates the go-proxmox mocks.Off() call which internally calls gock.Off() "
+            "to disable all active HTTP mock interceptors."
+        )
+    }
+
+
+@mcp.tool()
+async def get_vnc_ticket(server_url: str) -> dict:
+    """Retrieve a VNC ticket from the Proxmox server.
+    Use this when you need to authenticate and establish a VNC remote display session
+    for a virtual machine or container."""
+    url = server_url.rstrip("/") + "/vnc-ticket"
 
     try:
-        verify_ssl = not session["tls_insecure"]
-        ticket = session["ticket"]
-        csrf_token = session["csrf_token"]
-
-        results = {"success": True, "vms": [], "containers": []}
-
-        if node:
-            nodes_to_query = [node]
-        else:
-            # Fetch all nodes first
-            nodes_result = await _proxmox_request(
-                "GET", uri, "/nodes",
-                verify_ssl=verify_ssl, ticket=ticket, csrf_token=csrf_token
-            )
-            nodes_to_query = [n["node"] for n in nodes_result.get("data", [])]
-
-        for n in nodes_to_query:
-            # Fetch QEMU VMs
-            if resource_type in {"vm", "all"}:
-                try:
-                    vm_result = await _proxmox_request(
-                        "GET", uri, f"/nodes/{n}/qemu",
-                        verify_ssl=verify_ssl, ticket=ticket, csrf_token=csrf_token
-                    )
-                    for vm in vm_result.get("data", []):
-                        vm["node"] = n
-                        vm["type"] = "qemu"
-                    results["vms"].extend(vm_result.get("data", []))
-                except Exception:
-                    pass  # Node may not have QEMU VMs or may be offline
-
-            # Fetch LXC containers
-            if resource_type in {"lxc", "all"}:
-                try:
-                    lxc_result = await _proxmox_request(
-                        "GET", uri, f"/nodes/{n}/lxc",
-                        verify_ssl=verify_ssl, ticket=ticket, csrf_token=csrf_token
-                    )
-                    for ct in lxc_result.get("data", []):
-                        ct["node"] = n
-                        ct["type"] = "lxc"
-                    results["containers"].extend(lxc_result.get("data", []))
-                except Exception:
-                    pass  # Node may not have containers or may be offline
-
-        results["total_vms"] = len(results["vms"])
-        results["total_containers"] = len(results["containers"])
-        results["total"] = results["total_vms"] + results["total_containers"]
-        results["node_filter"] = node or "all nodes"
-        results["resource_type"] = resource_type
-
-        return results
-
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "server_url": server_url,
+                "endpoint": url,
+                "ticket_data": data
+            }
+    except httpx.ConnectError as e:
+        return {
+            "success": False,
+            "error": "Connection failed",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
+    except httpx.TimeoutException as e:
+        return {
+            "success": False,
+            "error": "Request timed out",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
     except httpx.HTTPStatusError as e:
         return {
             "success": False,
-            "error": f"HTTP error {e.response.status_code}: {e.response.text}"
+            "error": f"HTTP error {e.response.status_code}",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": "Unexpected error",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
+
+
+@mcp.tool()
+async def connect_terminal(
+    server_url: str,
+    node: Optional[str] = None,
+    vmid: Optional[int] = None
+) -> dict:
+    """Establish a WebSocket terminal (xterm) session to a Proxmox VM or container via the term-and-vnc proxy.
+    Use this when an interactive shell session is needed for a virtual machine or container
+    through the browser-based terminal interface."""
+    base_url = server_url.rstrip("/")
+    # Build the terminal endpoint (WebSocket)
+    ws_url = base_url if base_url.startswith("wss://") or base_url.startswith("ws://") else base_url
+
+    params = {}
+    if node:
+        params["node"] = node
+    if vmid is not None:
+        params["vmid"] = vmid
+
+    # Attempt an HTTP GET to the /term endpoint to validate connectivity
+    http_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
+    term_http_url = http_url + "/term" if not http_url.endswith("/term") else http_url
+
+    connection_info = {
+        "websocket_url": ws_url if ws_url.endswith("/term") else ws_url + "/term",
+        "node": node,
+        "vmid": vmid,
+        "parameters": params
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(term_http_url, params=params)
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "server_url": server_url,
+                "endpoint": term_http_url,
+                "connection_info": connection_info,
+                "message": (
+                    f"Terminal endpoint is reachable. Connect via WebSocket to "
+                    f"{connection_info['websocket_url']} to start an interactive terminal session."
+                )
+            }
+    except httpx.ConnectError as e:
+        return {
+            "success": False,
+            "error": "Connection failed - proxy may not be running",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+    except httpx.TimeoutException as e:
+        return {
+            "success": False,
+            "error": "Request timed out",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "Unexpected error",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+
+
+@mcp.tool()
+async def connect_vnc(
+    server_url: str,
+    node: Optional[str] = None,
+    vmid: Optional[int] = None,
+    ticket: Optional[str] = None
+) -> dict:
+    """Establish a WebSocket VNC session to a Proxmox VM or container via the term-and-vnc proxy.
+    Use this when a graphical remote display session is needed for a virtual machine
+    through the browser-based VNC interface."""
+    base_url = server_url.rstrip("/")
+    ws_url = base_url if base_url.startswith("wss://") or base_url.startswith("ws://") else base_url
+
+    params = {}
+    if node:
+        params["node"] = node
+    if vmid is not None:
+        params["vmid"] = vmid
+    if ticket:
+        params["ticket"] = ticket
+
+    # Attempt HTTP check
+    http_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
+    vnc_http_url = http_url + "/vnc" if not http_url.endswith("/vnc") else http_url
+
+    vnc_ws_url = ws_url + "/vnc" if not ws_url.endswith("/vnc") else ws_url
+
+    connection_info = {
+        "websocket_url": vnc_ws_url,
+        "node": node,
+        "vmid": vmid,
+        "ticket_provided": ticket is not None,
+        "parameters": {k: v for k, v in params.items() if k != "ticket"}
+    }
+
+    if not ticket:
+        connection_info["hint"] = (
+            "No VNC ticket provided. Consider calling get_vnc_ticket first to obtain "
+            "an authentication ticket before establishing a VNC session."
+        )
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(vnc_http_url, params=params)
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "server_url": server_url,
+                "endpoint": vnc_http_url,
+                "connection_info": connection_info,
+                "message": (
+                    f"VNC endpoint is reachable. Connect via WebSocket to "
+                    f"{vnc_ws_url} to start a graphical VNC session."
+                )
+            }
+    except httpx.ConnectError as e:
+        return {
+            "success": False,
+            "error": "Connection failed - proxy may not be running",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+    except httpx.TimeoutException as e:
+        return {
+            "success": False,
+            "error": "Request timed out",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "Unexpected error",
+            "detail": str(e),
+            "server_url": server_url,
+            "connection_info": connection_info
+        }
+
+
+@mcp.tool()
+async def check_proxy_health(server_url: str) -> dict:
+    """Verify that the term-and-vnc proxy server is running and reachable by calling its root endpoint.
+    Use this as a health check before attempting terminal or VNC connections to confirm
+    the proxy is operational."""
+    url = server_url.rstrip("/") + "/"
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return {
+                "success": True,
+                "healthy": True,
+                "status_code": response.status_code,
+                "server_url": server_url,
+                "endpoint": url,
+                "response_body": response.text,
+                "message": f"Proxy server at {server_url} is up and running."
+            }
+    except httpx.ConnectError as e:
+        return {
+            "success": False,
+            "healthy": False,
+            "error": "Connection refused - proxy server may be down",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
+    except httpx.TimeoutException as e:
+        return {
+            "success": False,
+            "healthy": False,
+            "error": "Request timed out - proxy server may be overloaded or unreachable",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
+    except httpx.HTTPStatusError as e:
+        return {
+            "success": False,
+            "healthy": False,
+            "error": f"HTTP error {e.response.status_code}",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "healthy": False,
+            "error": "Unexpected error",
+            "detail": str(e),
+            "server_url": server_url,
+            "endpoint": url
+        }
 
 
 
@@ -547,5 +374,6 @@ app = Starlette(
     ],
     lifespan=sse_app.lifespan,
 )
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
